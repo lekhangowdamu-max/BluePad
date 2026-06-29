@@ -1,302 +1,378 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
-import { BookOpen } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowLeft, Bluetooth, Pencil, RadioTower, Save, Settings, WifiOff } from 'lucide-react'
 import { Layout } from './components/Layout'
-import { AnalyticsDashboard } from './components/AnalyticsDashboard'
 import { PwaStatusBar } from './components/PwaStatusBar'
-import { AnalyticsService } from './services/analyticsService'
 import { ConnectionManager, type ConnectionStatus } from './services/bluetoothService'
 import { useAppStore } from './stores/appStore'
-import type { AnalyticsSummary } from './types'
+import type { BluetoothDevice as BluePadHost, ConnectedDevice, Note } from './types'
+
+type AppMode = 'home' | 'settings' | 'editor'
+type ConnectionRole = 'none' | 'host' | 'client'
 
 function App() {
   const notes = useAppStore((state) => state.notes)
   const activeNoteKey = useAppStore((state) => state.activeNoteKey)
+  const hydrateNotes = useAppStore((state) => state.hydrateNotes)
   const openOrCreateNote = useAppStore((state) => state.openOrCreateNote)
+  const upsertRemoteNote = useAppStore((state) => state.upsertRemoteNote)
   const updateNoteContent = useAppStore((state) => state.updateNoteContent)
   const setActiveNoteKey = useAppStore((state) => state.setActiveNoteKey)
-  const hydrateNotes = useAppStore((state) => state.hydrateNotes)
-  const syncPendingChanges = useAppStore((state) => state.syncPendingChanges)
 
-  const [noteKeyInput, setNoteKeyInput] = useState('')
-  const [content, setContent] = useState('')
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('Offline Mode')
-  const [isConnected, setIsConnected] = useState(false)
-  const [analyticsView, setAnalyticsView] = useState<'notes' | 'verify' | 'dashboard'>('notes')
-  const [ownerPassword, setOwnerPassword] = useState('')
-  const [ownerCode, setOwnerCode] = useState('')
-  const [verificationMessage, setVerificationMessage] = useState('')
-  const [verificationStep, setVerificationStep] = useState(1)
-  const [analyticsSummary, setAnalyticsSummary] = useState<AnalyticsSummary | null>(null)
-  const [analyticsReady, setAnalyticsReady] = useState(false)
-  const [attemptsLeft, setAttemptsLeft] = useState(5)
-  const [bluetoothDeviceCount, setBluetoothDeviceCount] = useState(0)
   const connectionManager = useMemo(() => new ConnectionManager(), [])
-  const analyticsService = useMemo(() => new AnalyticsService(), [])
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
-  const logoClickCountRef = useRef(0)
-  const logoClickTimerRef = useRef<number | null>(null)
 
-  const activeNote = useMemo(() => notes.find((note) => note.noteKey === activeNoteKey), [notes, activeNoteKey])
+  const [mode, setMode] = useState<AppMode>('home')
+  const [role, setRole] = useState<ConnectionRole>('none')
+  const [deviceName, setDeviceName] = useState(() => connectionManager.getDeviceName())
+  const [settingsName, setSettingsName] = useState(deviceName)
+  const [passwordInput, setPasswordInput] = useState('')
+  const [content, setContent] = useState('')
+  const [status, setStatus] = useState<ConnectionStatus>('Disconnected')
+  const [statusMessage, setStatusMessage] = useState('Disconnected')
+  const [availableHosts, setAvailableHosts] = useState<BluePadHost[]>([])
+  const [connectedDevices, setConnectedDevices] = useState<ConnectedDevice[]>([])
+  const [browserWarning, setBrowserWarning] = useState('')
+  const [isScanning, setIsScanning] = useState(false)
+  const [saveState, setSaveState] = useState('Saved')
+  const [errorMessage, setErrorMessage] = useState('')
+  const lastSavedContentRef = useRef('')
+  const activeNoteKeyRef = useRef<string | undefined>(activeNoteKey)
+
+  const activeNote = useMemo(() => notes.find((note) => note.noteKey === activeNoteKey), [activeNoteKey, notes])
+
+  const persistHostNote = useCallback(
+    async (note: Note) => {
+      const saved = await updateNoteContent(note.noteKey, note.content)
+      return saved
+    },
+    [updateNoteContent],
+  )
 
   useEffect(() => {
     void hydrateNotes()
   }, [hydrateNotes])
 
   useEffect(() => {
-    const syncOnReconnect = () => {
-      void syncPendingChanges()
-    }
-
-    if (navigator.onLine) {
-      void syncPendingChanges()
-    }
-
-    window.addEventListener('online', syncOnReconnect)
-    return () => window.removeEventListener('online', syncOnReconnect)
-  }, [syncPendingChanges])
+    activeNoteKeyRef.current = activeNoteKey
+  }, [activeNoteKey])
 
   useEffect(() => {
     connectionManager.initialize({
-      onStatusChange: (status) => {
-        setConnectionStatus(status)
-        setIsConnected(status !== 'Offline Mode' && status !== 'Reconnecting' && status !== 'Synchronizing')
-        setBluetoothDeviceCount(connectionManager.getNearbyDeviceCount())
+      onStatusChange: (nextStatus) => {
+        setStatus(nextStatus)
+        setStatusMessage(nextStatus === 'Host Running' ? 'BluePad Host Running' : nextStatus)
       },
+      onHostsChanged: setAvailableHosts,
+      onConnectedDevicesChanged: setConnectedDevices,
+      onNoteSynced: (note) => {
+        upsertRemoteNote(note)
+        if (note.noteKey === activeNoteKeyRef.current) {
+          lastSavedContentRef.current = note.content
+          setContent(note.content)
+          setSaveState('Synced')
+        }
+      },
+      onOpenNoteRequested: async (passwordKey) => {
+        const { note } = await openOrCreateNote(passwordKey, false)
+        connectionManager.subscribeToNote(note.noteKey)
+        return note
+      },
+      onClientNoteChanged: persistHostNote,
+      onHostMessage: setStatusMessage,
     })
-    setBluetoothDeviceCount(connectionManager.getNearbyDeviceCount())
+    setBrowserWarning(connectionManager.getBrowserWarning())
 
+    return () => connectionManager.shutdown()
+  }, [connectionManager, openOrCreateNote, persistHostNote, upsertRemoteNote])
+
+  useEffect(() => {
+    if (!activeNote) return
+    setContent(activeNote.content)
+    lastSavedContentRef.current = activeNote.content
+    connectionManager.subscribeToNote(activeNote.noteKey)
+  }, [activeNote, connectionManager])
+
+  const commitDeviceName = (nextName: string) => {
+    connectionManager.setDeviceName(nextName)
+    const savedName = connectionManager.getDeviceName()
+    setDeviceName(savedName)
+    setSettingsName(savedName)
+  }
+
+  const handleChangeDeviceName = () => {
+    commitDeviceName(settingsName)
+    setMode('home')
+  }
+
+  const handleStartHost = async () => {
+    setErrorMessage('')
+    await connectionManager.startHost()
+    setRole('host')
+    setConnectedDevices(connectionManager.getConnectedDevices())
+  }
+
+  const handleScan = async () => {
+    setErrorMessage('')
+    setIsScanning(true)
+    setStatusMessage('Scanning for BluePad Hosts')
+    const hosts = await connectionManager.scanForHosts()
+    setAvailableHosts(hosts)
+    setIsScanning(false)
+    setStatusMessage(hosts.length > 0 ? 'Select a BluePad Host' : 'No BluePad Hosts found')
+  }
+
+  const handleConnect = (hostId: string) => {
+    setErrorMessage('')
+    if (connectionManager.connectToHost(hostId)) {
+      setRole('client')
+      setStatusMessage('Connected to BluePad Host')
+    }
+  }
+
+  const handleOpenNote = async () => {
+    const passwordKey = passwordInput.trim()
+    if (!passwordKey) return
+    setErrorMessage('')
+
+    try {
+      const result = role === 'client'
+        ? { note: await connectionManager.openNoteOnHost(passwordKey), created: false }
+        : await openOrCreateNote(passwordKey)
+
+      upsertRemoteNote(result.note)
+      setActiveNoteKey(result.note.noteKey)
+      setContent(result.note.content)
+      lastSavedContentRef.current = result.note.content
+      connectionManager.subscribeToNote(result.note.noteKey)
+      setMode('editor')
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to open note.')
+    }
+  }
+
+  const saveCurrentNote = useCallback(async () => {
+    if (!activeNoteKey || content === lastSavedContentRef.current) return
+    const baseNote = activeNote ?? {
+      id: crypto.randomUUID(),
+      noteKey: activeNoteKey,
+      passwordKey: activeNoteKey,
+      content: '',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }
+    const nextNote = { ...baseNote, content, updatedAt: new Date().toISOString() }
+
+    setSaveState('Saving')
+    try {
+      const saved = role === 'client'
+        ? await connectionManager.sendNoteUpdateToHost(nextNote)
+        : await updateNoteContent(activeNoteKey, content)
+
+      upsertRemoteNote(saved)
+      if (role === 'host') {
+        connectionManager.broadcastNote(saved)
+      }
+      lastSavedContentRef.current = saved.content
+      setSaveState('Saved')
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to save note.')
+      setSaveState('Disconnected')
+    }
+  }, [activeNote, activeNoteKey, connectionManager, content, role, updateNoteContent, upsertRemoteNote])
+
+  useEffect(() => {
+    if (mode !== 'editor' || !activeNoteKey) return
+    const stopTypingTimer = window.setTimeout(() => void saveCurrentNote(), 700)
+    const intervalTimer = window.setInterval(() => void saveCurrentNote(), 2000)
     return () => {
-      connectionManager.shutdown()
+      window.clearTimeout(stopTypingTimer)
+      window.clearInterval(intervalTimer)
     }
-  }, [connectionManager])
+  }, [activeNoteKey, content, mode, saveCurrentNote])
 
-  useEffect(() => {
-    analyticsService.initialize().then(() => {
-      analyticsService.trackDeviceUsage(false)
-      setAnalyticsReady(true)
-    })
-  }, [analyticsService])
-
-  useEffect(() => {
-    if (activeNote) {
-      setContent(activeNote.content)
-    }
-  }, [activeNote])
-
-  useEffect(() => {
-    if (!analyticsReady) return
-    setAnalyticsSummary(analyticsService.getDashboardSummary(notes, bluetoothDeviceCount))
-  }, [analyticsReady, analyticsService, bluetoothDeviceCount, notes])
-
-  useEffect(() => {
-    if (!activeNoteKey || !activeNote) return
-    const timer = window.setInterval(() => {
-      if (activeNote.content !== content) {
-        updateNoteContent(activeNoteKey, content)
-      }
-    }, 1000)
-
-    return () => window.clearInterval(timer)
-  }, [activeNoteKey, activeNote, content, updateNoteContent])
-
-  const openAnalytics = useCallback(async () => {
-    await analyticsService.initialize()
-    setVerificationMessage('')
-    setVerificationStep(1)
-    setOwnerPassword('')
-    setOwnerCode('')
-    setAttemptsLeft(5)
-    setAnalyticsView('verify')
-  }, [analyticsService])
-
-  useEffect(() => {
-    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'a') {
-        event.preventDefault()
-        void openAnalytics()
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [openAnalytics])
-
-  const handleOpen = () => {
-    const noteKey = noteKeyInput.trim()
-    if (!noteKey) return
-
-    const { note, created } = openOrCreateNote(noteKey)
-    analyticsService.trackDeviceUsage(created, note.noteKey)
-    setActiveNoteKey(note.noteKey)
-    setContent(note.content)
-    setNoteKeyInput(note.noteKey)
-  }
-
-  const handleBack = () => {
-    if (activeNoteKey) {
-      updateNoteContent(activeNoteKey, content)
-    }
+  const handleBack = async () => {
+    await saveCurrentNote()
     setActiveNoteKey(undefined)
+    setMode('home')
   }
 
-  const handleContentKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
-      event.preventDefault()
-    }
-  }
-
-  const handleLogoClick = async () => {
-    const now = Date.now()
-    if (logoClickTimerRef.current && now - logoClickTimerRef.current < 500) {
-      logoClickCountRef.current += 1
-    } else {
-      logoClickCountRef.current = 1
-    }
-    logoClickTimerRef.current = now
-
-    if (logoClickCountRef.current >= 3) {
-      await openAnalytics()
-    }
-  }
-
-  const handleVerifyStepOne = async () => {
-    const result = await analyticsService.verifyStep1(ownerPassword)
-    setAttemptsLeft(result.attemptsLeft)
-    setVerificationMessage(result.message)
-    if (result.success) {
-      setVerificationStep(2)
-    }
-    if (result.locked) {
-      setVerificationStep(1)
-    }
-  }
-
-  const handleVerifyStepTwo = async () => {
-    const result = await analyticsService.verifyStep2(ownerCode)
-    setAttemptsLeft(result.attemptsLeft)
-    setVerificationMessage(result.message)
-    if (result.success) {
-      setAnalyticsSummary(analyticsService.getDashboardSummary(notes, bluetoothDeviceCount))
-      setAnalyticsView('dashboard')
-      setOwnerCode('')
-      setOwnerPassword('')
-    }
-  }
-
-  if (analyticsView === 'dashboard') {
-    return <AnalyticsDashboard summary={analyticsSummary} onClose={() => setAnalyticsView('notes')} />
-  }
+  const connectionLabel = role === 'none'
+    ? 'Personal Mode'
+    : status === 'Connected'
+      ? 'Connected'
+      : status === 'Reconnecting'
+        ? 'Reconnecting'
+        : status === 'Host Running'
+          ? 'Host Running'
+          : 'Disconnected'
 
   return (
     <Layout>
-      <div className="relative mx-auto flex min-h-[calc(100vh-3rem)] max-w-4xl flex-col justify-center px-5 py-10 text-slate-100">
-        <PwaStatusBar />
-        {!analyticsView || analyticsView === 'notes' ? (
-          <button
-            type="button"
-            onClick={() => void openAnalytics()}
-            title="Analytics Dashboard"
-            aria-label="Open Analytics Dashboard"
-            className="absolute right-3 top-3 z-10 inline-flex h-12 w-12 items-center justify-center rounded-full border border-slate-700 bg-slate-900/90 text-cyan-400 shadow-lg shadow-cyan-950/20 transition duration-200 hover:-translate-y-0.5 hover:border-cyan-400 hover:bg-slate-800 hover:text-cyan-300 sm:right-6 sm:top-6"
-          >
-            <BookOpen className="h-5 w-5" />
+      <div className="mx-auto flex min-h-[calc(100vh-2.5rem)] max-w-5xl flex-col px-2 py-4 text-slate-100">
+        <PwaStatusBar compact />
+
+        <header className="mb-5 flex flex-col gap-3 border-b border-slate-800 pb-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-sm uppercase tracking-[0.35em] text-cyan-400">BluePad Logo</p>
+            <h1 className="mt-2 text-3xl font-semibold">BluePad</h1>
+          </div>
+          <button onClick={() => setMode('settings')} className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 px-4 py-3 text-sm transition hover:border-cyan-400">
+            <Settings className="h-4 w-4" />
+            Settings
           </button>
+        </header>
+
+        {browserWarning ? (
+          <div className="mb-4 rounded-2xl border border-amber-700 bg-amber-950/60 p-4 text-sm text-amber-100">
+            {browserWarning}
+          </div>
         ) : null}
 
-        {analyticsView === 'verify' && (
-          <div className="fixed inset-0 z-20 flex items-center justify-center bg-slate-950/85 px-4 backdrop-blur-sm">
-            <div className="w-full max-w-md rounded-[2rem] border border-slate-800 bg-slate-900/95 p-6 shadow-2xl shadow-cyan-950/30">
-              <p className="text-xs uppercase tracking-[0.35em] text-cyan-400">Owner access</p>
-              <h2 className="mt-3 text-2xl font-semibold">Two-step verification</h2>
-              <p className="mt-2 text-sm text-slate-400">This is a private path for the owner only.</p>
-
-              {verificationStep === 1 ? (
-                <>
-                  <label className="mt-5 block text-sm text-slate-400">Owner password</label>
-                  <input
-                    value={ownerPassword}
-                    onChange={(event) => setOwnerPassword(event.target.value)}
-                    type="password"
-                    className="mt-2 w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm outline-none transition focus:border-cyan-500"
-                  />
-                  <button onClick={() => void handleVerifyStepOne()} className="mt-5 w-full rounded-2xl bg-cyan-500 px-4 py-3 font-semibold text-slate-950 transition hover:bg-cyan-400">
-                    Continue
-                  </button>
-                </>
-              ) : (
-                <>
-                  <label className="mt-5 block text-sm text-slate-400">Verification code</label>
-                  <input
-                    value={ownerCode}
-                    onChange={(event) => setOwnerCode(event.target.value)}
-                    className="mt-2 w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm outline-none transition focus:border-cyan-500"
-                  />
-                  <button onClick={() => void handleVerifyStepTwo()} className="mt-5 w-full rounded-2xl bg-cyan-500 px-4 py-3 font-semibold text-slate-950 transition hover:bg-cyan-400">
-                    Unlock analytics
-                  </button>
-                </>
-              )}
-
-              {verificationMessage ? <p className="mt-4 text-sm text-cyan-300">{verificationMessage}</p> : null}
-              <p className="mt-4 text-sm text-slate-500">Attempts left: {attemptsLeft}</p>
-              <button onClick={() => setAnalyticsView('notes')} className="mt-4 text-sm text-slate-400 transition hover:text-slate-200">
-                Cancel
-              </button>
-            </div>
+        {errorMessage ? (
+          <div className="mb-4 rounded-2xl border border-rose-700 bg-rose-950/60 p-4 text-sm text-rose-100">
+            {errorMessage}
           </div>
-        )}
+        ) : null}
 
-        {!activeNoteKey ? (
-          <section className="rounded-[2rem] border border-slate-800 bg-slate-950/90 p-10 text-center shadow-2xl shadow-cyan-950/20">
-            <div className="mb-8">
-              <button onClick={handleLogoClick} className="text-sm uppercase tracking-[0.35em] text-cyan-400">
-                BluePad
-              </button>
-              <h1 className="mt-4 text-4xl font-semibold">Enter Note Key</h1>
-            </div>
-            <label className="block text-left text-sm text-slate-400">Note Key</label>
+        {mode === 'settings' ? (
+          <section className="max-w-xl rounded-2xl border border-slate-800 bg-slate-950/90 p-6">
+            <button onClick={() => setMode('home')} className="mb-5 inline-flex items-center gap-2 text-sm text-slate-300 hover:text-cyan-300">
+              <ArrowLeft className="h-4 w-4" />
+              Back
+            </button>
+            <h2 className="text-2xl font-semibold">Settings</h2>
+            <label className="mt-6 block text-sm text-slate-400">BluePad Device Name</label>
             <input
-              value={noteKeyInput}
-              onChange={(event) => setNoteKeyInput(event.target.value)}
-              placeholder="college_notes"
-              className="mt-2 w-full rounded-3xl border border-slate-700 bg-slate-900/90 px-4 py-4 text-lg outline-none transition focus:border-cyan-500"
+              value={settingsName}
+              onChange={(event) => setSettingsName(event.target.value)}
+              className="mt-2 w-full rounded-2xl border border-slate-700 bg-slate-900 px-4 py-3 outline-none transition focus:border-cyan-400"
             />
-            <button onClick={handleOpen} className="mt-8 inline-flex w-full justify-center rounded-3xl bg-cyan-500 px-6 py-4 text-lg font-semibold text-slate-950 transition hover:bg-cyan-400">
-              OPEN
+            <button onClick={handleChangeDeviceName} className="mt-5 inline-flex items-center gap-2 rounded-2xl bg-cyan-400 px-5 py-3 font-semibold text-slate-950 hover:bg-cyan-300">
+              <Pencil className="h-4 w-4" />
+              Change Device Name
             </button>
           </section>
-        ) : (
-          <section className="flex min-h-[calc(100vh-6rem)] flex-col rounded-[2rem] border border-slate-800 bg-slate-950/90 p-5 shadow-2xl shadow-cyan-950/20">
-            <div className="mb-4 flex flex-col gap-3 rounded-3xl border border-slate-800 bg-slate-900/80 px-4 py-3 text-sm text-slate-300 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-center justify-between gap-4">
-                <button onClick={handleBack} className="rounded-2xl border border-slate-700 bg-slate-900/90 px-4 py-2 text-sm text-slate-100 transition hover:bg-slate-800">
-                  Back
-                </button>
+        ) : null}
+
+        {mode === 'home' ? (
+          <div className="grid gap-5 lg:grid-cols-[1fr_1.1fr]">
+            <section className="rounded-2xl border border-slate-800 bg-slate-950/90 p-6">
+              <div className="flex items-start justify-between gap-4">
                 <div>
-                  <p className="text-slate-400">Note Key</p>
-                  <p className="font-semibold text-slate-100">{activeNote?.noteKey}</p>
+                  <h2 className="text-xl font-semibold">Main Screen</h2>
+                  <p className="mt-1 text-sm text-slate-400">Device Name: {deviceName}</p>
                 </div>
+                <span className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">{connectionLabel}</span>
               </div>
-              <div className="rounded-3xl bg-slate-900/80 px-4 py-3 text-sm text-slate-200">
-                {connectionStatus}
+
+              <div className="mt-6 grid gap-3 sm:grid-cols-2">
+                <button onClick={() => void handleStartHost()} className="inline-flex items-center justify-center gap-2 rounded-2xl bg-cyan-400 px-5 py-4 font-semibold text-slate-950 hover:bg-cyan-300">
+                  <RadioTower className="h-5 w-5" />
+                  Start Host
+                </button>
+                <button onClick={() => void handleScan()} className="inline-flex items-center justify-center gap-2 rounded-2xl border border-cyan-700 px-5 py-4 font-semibold text-cyan-100 hover:border-cyan-300">
+                  <Bluetooth className="h-5 w-5" />
+                  Connect to Host
+                </button>
+              </div>
+
+              <label className="mt-7 block text-sm text-slate-400">Enter Password</label>
+              <input
+                value={passwordInput}
+                onChange={(event) => setPasswordInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') void handleOpenNote()
+                }}
+                type="password"
+                placeholder="friendsgroup"
+                className="mt-2 w-full rounded-2xl border border-slate-700 bg-slate-900 px-4 py-4 text-lg outline-none transition focus:border-cyan-400"
+              />
+              <button onClick={() => void handleOpenNote()} className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-slate-100 px-5 py-4 font-semibold text-slate-950 hover:bg-white">
+                <Save className="h-5 w-5" />
+                Open Note
+              </button>
+            </section>
+
+            <aside className="space-y-5">
+              <section className="rounded-2xl border border-slate-800 bg-slate-950/90 p-6">
+                <h2 className="text-xl font-semibold">{role === 'host' ? 'BluePad Host Running' : role === 'client' ? statusMessage : 'Personal Mode'}</h2>
+                <dl className="mt-5 grid gap-3 text-sm">
+                  <div className="flex justify-between gap-4 border-b border-slate-800 pb-3">
+                    <dt className="text-slate-400">Device Name</dt>
+                    <dd>{deviceName}</dd>
+                  </div>
+                  <div className="flex justify-between gap-4 border-b border-slate-800 pb-3">
+                    <dt className="text-slate-400">Connected Devices</dt>
+                    <dd>{connectedDevices.length}</dd>
+                  </div>
+                  <div className="flex justify-between gap-4">
+                    <dt className="text-slate-400">Host Status</dt>
+                    <dd>{role === 'host' ? 'Running' : role === 'client' ? status : 'Local Notes'}</dd>
+                  </div>
+                </dl>
+                {role === 'host' ? (
+                  <div className="mt-5">
+                    <p className="text-sm font-semibold text-slate-200">Connected Users:</p>
+                    {connectedDevices.length > 0 ? (
+                      <ul className="mt-3 space-y-2 text-sm text-slate-300">
+                        {connectedDevices.map((device) => <li key={device.id}>{device.deviceName}</li>)}
+                      </ul>
+                    ) : (
+                      <p className="mt-3 text-sm text-slate-500">No connected users yet.</p>
+                    )}
+                  </div>
+                ) : null}
+              </section>
+
+              <section className="rounded-2xl border border-slate-800 bg-slate-950/90 p-6">
+                <h2 className="text-xl font-semibold">Available BluePad Hosts</h2>
+                <div className="mt-4 space-y-3">
+                  {isScanning ? <p className="text-sm text-cyan-300">Scanning...</p> : null}
+                  {availableHosts.map((host) => (
+                    <div key={host.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-3">
+                      <div>
+                        <p className="font-medium">{host.deviceName}</p>
+                        <p className="text-xs text-slate-500">{host.status ?? 'Available'}</p>
+                      </div>
+                      <button onClick={() => handleConnect(host.id)} className="rounded-xl border border-cyan-700 px-4 py-2 text-sm text-cyan-100 hover:border-cyan-300">
+                        Connect
+                      </button>
+                    </div>
+                  ))}
+                  {!isScanning && availableHosts.length === 0 ? <p className="text-sm text-slate-500">No hosts discovered.</p> : null}
+                </div>
+              </section>
+            </aside>
+          </div>
+        ) : null}
+
+        {mode === 'editor' ? (
+          <section className="flex min-h-[calc(100vh-9rem)] flex-col rounded-2xl border border-slate-800 bg-slate-950/90 p-5">
+            <div className="mb-4 flex flex-col gap-3 border-b border-slate-800 pb-4 sm:flex-row sm:items-center sm:justify-between">
+              <button onClick={() => void handleBack()} className="inline-flex items-center gap-2 rounded-xl border border-slate-700 px-4 py-2 text-sm hover:border-cyan-400">
+                <ArrowLeft className="h-4 w-4" />
+                Back
+              </button>
+              <div className="text-sm text-slate-300">
+                <span className="text-slate-500">Password note:</span> {activeNoteKey}
+              </div>
+              <div className="inline-flex items-center gap-2 rounded-xl border border-slate-800 px-3 py-2 text-sm">
+                {status === 'Disconnected' ? <WifiOff className="h-4 w-4 text-rose-300" /> : <Bluetooth className="h-4 w-4 text-cyan-300" />}
+                {connectionLabel} · {saveState}
               </div>
             </div>
 
             <textarea
-              ref={textareaRef}
               value={content}
-              onChange={(event) => setContent(event.target.value)}
-              onKeyDown={handleContentKeyDown}
-              className="min-h-[calc(100vh-16rem)] w-full flex-1 rounded-[2rem] border border-slate-800 bg-slate-950/90 p-6 text-base leading-7 outline-none placeholder:text-slate-500"
+              onChange={(event) => {
+                setContent(event.target.value)
+                setSaveState('Unsaved')
+              }}
+              className="min-h-[calc(100vh-17rem)] w-full flex-1 resize-none rounded-2xl border border-slate-800 bg-slate-950 p-5 leading-7 outline-none transition focus:border-cyan-500"
               placeholder="Start typing..."
             />
-
-            <div className="mt-4 flex items-center justify-between text-xs uppercase tracking-[0.25em] text-slate-500">
-              <span>Auto-save every second</span>
-              <span>{isConnected ? 'Sync enabled' : 'Offline mode'}</span>
-            </div>
+            <div className="mt-3 text-xs uppercase tracking-[0.2em] text-slate-500">Auto save every 2 seconds and after typing stops</div>
           </section>
-        )}
+        ) : null}
       </div>
     </Layout>
   )

@@ -1,64 +1,98 @@
 import type { Note } from '../types'
 
-const NOTE_KEY = 'bluepad-notes'
-const PENDING_SYNC_KEY = 'bluepad-pending-sync'
+const LEGACY_NOTE_KEY = 'bluepad-notes'
 const DB_NAME = 'bluepad-db'
 const STORE_NAME = 'notes'
-const NOTES_RECORD_KEY = 'notes'
-const PENDING_RECORD_KEY = 'pendingSync'
+
+interface NoteRecord {
+  id: string
+  password_key: string
+  content: string
+  created_at: string
+  updated_at: string
+}
+
+const toNote = (record: NoteRecord): Note => ({
+  id: record.id,
+  noteKey: record.password_key,
+  passwordKey: record.password_key,
+  content: record.content,
+  createdAt: record.created_at,
+  updatedAt: record.updated_at,
+})
+
+const toRecord = (note: Note): NoteRecord => ({
+  id: note.id ?? crypto.randomUUID(),
+  password_key: note.passwordKey ?? note.noteKey,
+  content: note.content,
+  created_at: note.createdAt,
+  updated_at: note.updatedAt,
+})
 
 export class NoteRepository {
   loadNotes(): Note[] {
     if (typeof window === 'undefined') return []
-    const raw = window.localStorage.getItem(NOTE_KEY)
+    const raw = window.localStorage.getItem(LEGACY_NOTE_KEY)
     return raw ? (JSON.parse(raw) as Note[]) : []
   }
 
   async loadNotesFromIndexedDb(): Promise<Note[]> {
     if (typeof window === 'undefined' || !window.indexedDB) return this.loadNotes()
 
-    const notes = await this.readFromIndexedDb<Note[]>(NOTES_RECORD_KEY)
-    if (notes) return notes
+    const notes = await this.getAllRecords()
+    if (notes.length > 0) return notes.map(toNote)
 
-    const localNotes = this.loadNotes()
-    if (localNotes.length > 0) {
-      await this.persistToIndexedDb(localNotes, this.hasPendingChanges())
+    const legacyNotes = this.loadNotes()
+    if (legacyNotes.length > 0) {
+      await this.saveNotes(legacyNotes)
     }
-    return localNotes
+    return legacyNotes
+  }
+
+  async openOrCreateByPassword(passwordKey: string): Promise<{ note: Note; created: boolean }> {
+    const existing = await this.findByPassword(passwordKey)
+    if (existing) return { note: toNote(existing), created: false }
+
+    const now = new Date().toISOString()
+    const record: NoteRecord = {
+      id: crypto.randomUUID(),
+      password_key: passwordKey,
+      content: '',
+      created_at: now,
+      updated_at: now,
+    }
+
+    await this.putRecord(record)
+    return { note: toNote(record), created: true }
+  }
+
+  async saveNote(note: Note): Promise<Note> {
+    const record = toRecord({
+      ...note,
+      updatedAt: note.updatedAt || new Date().toISOString(),
+    })
+    await this.putRecord(record)
+    return toNote(record)
   }
 
   async saveNotes(notes: Note[]) {
-    if (typeof window === 'undefined') return
-    window.localStorage.setItem(NOTE_KEY, JSON.stringify(notes))
-    window.localStorage.setItem(PENDING_SYNC_KEY, 'true')
-
-    await this.persistToIndexedDb(notes, true)
+    await Promise.all(notes.map((note) => this.saveNote(note)))
   }
 
   async syncPendingChanges() {
-    if (typeof window === 'undefined') return
-    if (!navigator.onLine || !this.hasPendingChanges()) return
-
-    const notes = await this.loadNotesFromIndexedDb()
-    window.localStorage.setItem(NOTE_KEY, JSON.stringify(notes))
-    window.localStorage.removeItem(PENDING_SYNC_KEY)
-    await this.persistToIndexedDb(notes, false)
+    return Promise.resolve()
   }
 
-  private hasPendingChanges() {
-    if (typeof window === 'undefined') return false
-    return window.localStorage.getItem(PENDING_SYNC_KEY) === 'true'
-  }
-
-  private readFromIndexedDb<T>(key: string) {
-    return new Promise<T | undefined>((resolve) => {
+  private async findByPassword(passwordKey: string): Promise<NoteRecord | undefined> {
+    return new Promise((resolve) => {
       this.withStore('readonly', (store, db) => {
-        const getRequest = store.get(key)
-        getRequest.onsuccess = () => {
+        const index = store.index('password_key')
+        const request = index.get(passwordKey)
+        request.onsuccess = () => {
           db.close()
-          resolve(getRequest.result as T | undefined)
+          resolve(request.result as NoteRecord | undefined)
         }
-        getRequest.onerror = () => {
+        request.onerror = () => {
           db.close()
           resolve(undefined)
         }
@@ -66,12 +100,26 @@ export class NoteRepository {
     })
   }
 
-  private persistToIndexedDb(notes: Note[], pendingSync: boolean) {
-    return new Promise<void>((resolve) => {
-      this.withStore('readwrite', (store, db, transaction) => {
-        store.put(notes, NOTES_RECORD_KEY)
-        store.put(pendingSync, PENDING_RECORD_KEY)
+  private async getAllRecords(): Promise<NoteRecord[]> {
+    return new Promise((resolve) => {
+      this.withStore('readonly', (store, db) => {
+        const request = store.getAll()
+        request.onsuccess = () => {
+          db.close()
+          resolve(request.result as NoteRecord[])
+        }
+        request.onerror = () => {
+          db.close()
+          resolve([])
+        }
+      }, () => resolve([]))
+    })
+  }
 
+  private putRecord(record: NoteRecord): Promise<void> {
+    return new Promise((resolve) => {
+      this.withStore('readwrite', (store, db, transaction) => {
+        store.put(record)
         transaction.oncomplete = () => {
           db.close()
           resolve()
@@ -94,13 +142,16 @@ export class NoteRepository {
       return
     }
 
-    const request = window.indexedDB.open(DB_NAME, 1)
+    const request = window.indexedDB.open(DB_NAME, 2)
 
     request.onupgradeneeded = () => {
       const db = request.result
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME)
+      if (db.objectStoreNames.contains(STORE_NAME)) {
+        db.deleteObjectStore(STORE_NAME)
       }
+      const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' })
+      store.createIndex('password_key', 'password_key', { unique: true })
+      store.createIndex('updated_at', 'updated_at')
     }
 
     request.onsuccess = () => {

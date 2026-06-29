@@ -1,5 +1,7 @@
 export interface Note {
+  id?: string
   noteKey: string
+  passwordKey?: string
   content: string
   createdAt: string
   updatedAt: string
@@ -8,8 +10,15 @@ export interface Note {
 export interface BluetoothDevice {
   id: string
   deviceName: string
-  deviceAddress: string
+  deviceAddress?: string
   isTrusted: boolean
+  status?: 'Available' | 'Connected' | 'Disconnected' | 'Reconnecting'
+}
+
+export interface ConnectedDevice {
+  id: string
+  deviceName: string
+  status: 'Connected' | 'Disconnected' | 'Reconnecting'
 }
 
 export interface AnalyticsAccessLog {
@@ -49,4 +58,4 @@ export interface AnalyticsSummary {
   weeklyUsageStatistics: Array<{ label: string; value: number }>
 }
 
-export type ConnectionStatus = 'Connected via Bluetooth' | 'Connected to Main Server' | 'Offline Mode' | 'Synchronizing' | 'Reconnecting'
+export type ConnectionStatus = 'Connected' | 'Disconnected' | 'Reconnecting' | 'Host Running' | 'Bluetooth Unsupported'
