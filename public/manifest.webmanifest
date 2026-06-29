@@ -1,13 +1,19 @@
 {
+  "id": "/",
   "name": "BluePad",
   "short_name": "BluePad",
-  "description": "Offline Bluetooth Secure Notepad",
-  "theme_color": "#000000",
-  "background_color": "#000000",
+  "description": "Offline Bluetooth secure notes with local-first storage and optional nearby sharing.",
+  "theme_color": "#020617",
+  "background_color": "#020617",
   "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
   "orientation": "portrait",
   "start_url": "/",
   "scope": "/",
+  "categories": ["productivity", "utilities"],
+  "launch_handler": {
+    "client_mode": "navigate-existing"
+  },
   "icons": [
     {
       "src": "/icons/icon-72x72.png",

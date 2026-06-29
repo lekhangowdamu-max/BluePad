@@ -12,7 +12,8 @@ export interface BluetoothDevice {
   deviceName: string
   deviceAddress?: string
   isTrusted: boolean
-  status?: 'Available' | 'Connected' | 'Disconnected' | 'Reconnecting'
+  status?: 'Online' | 'Connecting' | 'Connected' | 'Reconnecting' | 'Disconnected'
+  lastSeen?: number
 }
 
 export interface ConnectedDevice {
@@ -58,4 +59,4 @@ export interface AnalyticsSummary {
   weeklyUsageStatistics: Array<{ label: string; value: number }>
 }
 
-export type ConnectionStatus = 'Connected' | 'Disconnected' | 'Reconnecting' | 'Host Running' | 'Bluetooth Unsupported'
+export type ConnectionStatus = 'Searching' | 'Connecting' | 'Connected' | 'Reconnecting' | 'Disconnected' | 'Host Running' | 'Bluetooth Unsupported'

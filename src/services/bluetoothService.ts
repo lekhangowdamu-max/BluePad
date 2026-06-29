@@ -5,6 +5,10 @@ const DEVICE_NAME_KEY = 'bluepad-device-name'
 const DEVICE_ID_KEY = 'bluepad-device-id'
 const HOST_CHANNEL = 'bluepad-host-channel'
 const NOTE_CHANNEL_PREFIX = 'bluepad-note-'
+const HOST_ANNOUNCE_INTERVAL_MS = 2000
+const DISCOVERY_INTERVAL_MS = 2000
+const RECONNECT_INTERVAL_MS = 5000
+const HOST_STALE_MS = 7000
 
 interface ConnectionCallbacks {
   onStatusChange: (status: ConnectionStatus) => void
@@ -20,6 +24,7 @@ interface HostAnnouncement {
   type: 'host-announcement'
   id: string
   deviceName: string
+  sentAt: number
 }
 
 interface ClientJoin {
@@ -67,12 +72,15 @@ export class ConnectionManager {
   private hostChannel?: BroadcastChannel
   private noteChannels = new Map<string, BroadcastChannel>()
   private announceTimer?: number
+  private discoveryTimer?: number
   private reconnectTimer?: number
   private hosts = new Map<string, BluetoothDevice>()
   private connectedDevices = new Map<string, ConnectedDevice>()
   private pendingOpenRequests = new Map<string, (note: Note) => void>()
   private isHost = false
+  private isScanning = false
   private connectedHostId?: string
+  private preferredHostId?: string
   private readonly deviceId: string
 
   constructor() {
@@ -84,11 +92,27 @@ export class ConnectionManager {
     this.setStatus(this.getBrowserWarning() ? 'Bluetooth Unsupported' : 'Disconnected')
     this.openHostDiscoveryChannel()
     this.reconnectTimer = window.setInterval(() => {
-      if (this.connectedHostId) {
-        this.setStatus('Reconnecting')
-        window.setTimeout(() => this.setStatus('Connected'), 600)
+      if (!this.preferredHostId || this.isHost) return
+
+      const host = this.hosts.get(this.preferredHostId)
+      if (host && !this.isHostStale(host)) {
+        this.connectedHostId = host.id
+        host.status = 'Connected'
+        this.postClientJoin()
+        this.setStatus('Connected')
+        this.emitHosts()
+        return
       }
-    }, 15000)
+
+      if (this.connectedHostId) {
+        this.connectedHostId = undefined
+      }
+      if (host) {
+        host.status = 'Reconnecting'
+      }
+      this.setStatus('Reconnecting')
+      this.emitHosts()
+    }, RECONNECT_INTERVAL_MS)
   }
 
   getDeviceId() {
@@ -113,7 +137,7 @@ export class ConnectionManager {
 
   getBrowserWarning() {
     if (!isChromeOrEdge() || !('bluetooth' in navigator)) {
-      return 'Bluetooth features require Chrome or Edge.'
+      return 'Bluetooth features work best in Chrome and Edge.'
     }
     return ''
   }
@@ -131,14 +155,18 @@ export class ConnectionManager {
     this.connectedHostId = this.deviceId
     this.openHostDiscoveryChannel()
     this.announceHost()
-    this.announceTimer = window.setInterval(() => this.announceHost(), 2500)
+    if (this.announceTimer) window.clearInterval(this.announceTimer)
+    this.announceTimer = window.setInterval(() => this.announceHost(), HOST_ANNOUNCE_INTERVAL_MS)
     this.setStatus('Host Running')
     this.callbacks?.onHostMessage?.('BluePad Host Running')
   }
 
   async scanForHosts() {
     this.openHostDiscoveryChannel()
+    this.isScanning = true
+    this.setStatus('Searching')
     this.announceHostProbe()
+    this.startContinuousDiscovery()
 
     if ('bluetooth' in navigator && typeof navigator.bluetooth?.requestDevice === 'function') {
       try {
@@ -146,13 +174,15 @@ export class ConnectionManager {
           filters: [{ namePrefix: 'BluePad' }],
           optionalServices: ['0000feed-0000-1000-8000-00805f9b34fb'],
         })
-        const host: BluetoothDevice = {
-          id: device.id,
-          deviceName: device.name || 'BluePad Host',
-          isTrusted: true,
-          status: 'Available',
+        if (device.name) {
+          this.hosts.set(device.id, {
+            id: device.id,
+            deviceName: device.name,
+            isTrusted: true,
+            status: 'Online',
+            lastSeen: Date.now(),
+          })
         }
-        this.hosts.set(host.id, host)
       } catch {
         // The user can cancel the browser chooser; keep locally discovered hosts.
       }
@@ -169,13 +199,14 @@ export class ConnectionManager {
       return false
     }
 
+    this.preferredHostId = host.id
+    this.setStatus('Connecting')
+    host.status = 'Connecting'
+    this.emitHosts()
+
     this.connectedHostId = host.id
     host.status = 'Connected'
-    this.hostChannel?.postMessage({
-      type: 'client-join',
-      id: this.deviceId,
-      deviceName: this.getDeviceName(),
-    } satisfies ClientJoin)
+    this.postClientJoin()
     this.setStatus('Connected')
     this.emitHosts()
     return true
@@ -257,6 +288,7 @@ export class ConnectionManager {
 
   shutdown() {
     if (this.announceTimer) window.clearInterval(this.announceTimer)
+    if (this.discoveryTimer) window.clearInterval(this.discoveryTimer)
     if (this.reconnectTimer) window.clearInterval(this.reconnectTimer)
     this.hostChannel?.close()
     this.noteChannels.forEach((channel) => channel.close())
@@ -276,12 +308,17 @@ export class ConnectionManager {
     this.hostChannel = new BroadcastChannel(HOST_CHANNEL)
     this.hostChannel.onmessage = (event: MessageEvent<HostChannelMessage>) => {
       if (event.data.type === 'host-announcement' && event.data.id !== this.deviceId) {
+        const existing = this.hosts.get(event.data.id)
         this.hosts.set(event.data.id, {
           id: event.data.id,
           deviceName: event.data.deviceName,
           isTrusted: true,
-          status: this.connectedHostId === event.data.id ? 'Connected' : 'Available',
+          status: this.connectedHostId === event.data.id ? 'Connected' : 'Online',
+          lastSeen: event.data.sentAt,
         })
+        if (existing?.status === 'Reconnecting' && this.preferredHostId === event.data.id) {
+          this.connectToHost(event.data.id)
+        }
         this.emitHosts()
       }
 
@@ -332,7 +369,41 @@ export class ConnectionManager {
       type: 'host-announcement',
       id: this.deviceId,
       deviceName: this.getDeviceName(),
+      sentAt: Date.now(),
     } satisfies HostAnnouncement)
+  }
+
+  private postClientJoin() {
+    this.hostChannel?.postMessage({
+      type: 'client-join',
+      id: this.deviceId,
+      deviceName: this.getDeviceName(),
+    } satisfies ClientJoin)
+  }
+
+  private startContinuousDiscovery() {
+    if (this.discoveryTimer) return
+    this.discoveryTimer = window.setInterval(() => {
+      if (!this.isScanning) return
+      this.announceHostProbe()
+      this.pruneStaleHosts()
+      this.emitHosts()
+    }, DISCOVERY_INTERVAL_MS)
+  }
+
+  private pruneStaleHosts() {
+    const now = Date.now()
+    this.hosts.forEach((host) => {
+      if (this.isHostStale(host, now)) {
+        host.status = this.preferredHostId === host.id ? 'Reconnecting' : 'Disconnected'
+      } else if (host.status !== 'Connected' && host.status !== 'Connecting') {
+        host.status = 'Online'
+      }
+    })
+  }
+
+  private isHostStale(host: BluetoothDevice, now = Date.now()) {
+    return Boolean(host.lastSeen && now - host.lastSeen > HOST_STALE_MS)
   }
 
   private emitHosts() {

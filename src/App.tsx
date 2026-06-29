@@ -116,8 +116,7 @@ function App() {
     setStatusMessage('Scanning for BluePad Hosts')
     const hosts = await connectionManager.scanForHosts()
     setAvailableHosts(hosts)
-    setIsScanning(false)
-    setStatusMessage(hosts.length > 0 ? 'Select a BluePad Host' : 'No BluePad Hosts found')
+    setStatusMessage(hosts.length > 0 ? 'Select a BluePad Host' : 'No nearby BluePad Hosts found.')
   }
 
   const handleConnect = (hostId: string) => {
@@ -197,7 +196,11 @@ function App() {
 
   const connectionLabel = role === 'none'
     ? 'Personal Mode'
-    : status === 'Connected'
+    : status === 'Searching'
+      ? 'Searching'
+      : status === 'Connecting'
+        ? 'Connecting'
+        : status === 'Connected'
       ? 'Connected'
       : status === 'Reconnecting'
         ? 'Reconnecting'
@@ -304,10 +307,16 @@ function App() {
                     <dt className="text-slate-400">Connected Devices</dt>
                     <dd>{connectedDevices.length}</dd>
                   </div>
-                  <div className="flex justify-between gap-4">
+                  <div className="flex justify-between gap-4 border-b border-slate-800 pb-3">
                     <dt className="text-slate-400">Host Status</dt>
                     <dd>{role === 'host' ? 'Running' : role === 'client' ? status : 'Local Notes'}</dd>
                   </div>
+                  {role === 'host' ? (
+                    <div className="flex justify-between gap-4">
+                      <dt className="text-slate-400">Status</dt>
+                      <dd>Visible to nearby devices</dd>
+                    </div>
+                  ) : null}
                 </dl>
                 {role === 'host' ? (
                   <div className="mt-5">
@@ -326,19 +335,19 @@ function App() {
               <section className="rounded-2xl border border-slate-800 bg-slate-950/90 p-6">
                 <h2 className="text-xl font-semibold">Available BluePad Hosts</h2>
                 <div className="mt-4 space-y-3">
-                  {isScanning ? <p className="text-sm text-cyan-300">Scanning...</p> : null}
+                  {isScanning ? <p className="text-sm text-cyan-300">Searching</p> : null}
                   {availableHosts.map((host) => (
                     <div key={host.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-3">
                       <div>
                         <p className="font-medium">{host.deviceName}</p>
-                        <p className="text-xs text-slate-500">{host.status ?? 'Available'}</p>
+                        <p className="text-xs text-slate-500">{host.status ?? 'Online'}</p>
                       </div>
                       <button onClick={() => handleConnect(host.id)} className="rounded-xl border border-cyan-700 px-4 py-2 text-sm text-cyan-100 hover:border-cyan-300">
                         Connect
                       </button>
                     </div>
                   ))}
-                  {!isScanning && availableHosts.length === 0 ? <p className="text-sm text-slate-500">No hosts discovered.</p> : null}
+                  {isScanning && availableHosts.length === 0 ? <p className="text-sm text-slate-500">No nearby BluePad Hosts found.</p> : null}
                 </div>
               </section>
             </aside>
@@ -356,8 +365,8 @@ function App() {
                 <span className="text-slate-500">Password note:</span> {activeNoteKey}
               </div>
               <div className="inline-flex items-center gap-2 rounded-xl border border-slate-800 px-3 py-2 text-sm">
-                {status === 'Disconnected' ? <WifiOff className="h-4 w-4 text-rose-300" /> : <Bluetooth className="h-4 w-4 text-cyan-300" />}
-                {connectionLabel} · {saveState}
+                {status === 'Disconnected' || role === 'none' ? <WifiOff className="h-4 w-4 text-rose-300" /> : <Bluetooth className="h-4 w-4 text-cyan-300" />}
+                {connectionLabel} - {saveState}
               </div>
             </div>
 

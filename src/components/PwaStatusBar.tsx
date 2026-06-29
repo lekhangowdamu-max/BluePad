@@ -1,4 +1,4 @@
-import { CheckCircle2, WifiOff, Wifi } from 'lucide-react'
+import { CheckCircle2, Download, Wifi, WifiOff } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { installPwa, pwaStatus, refreshApp } from '../pwa'
 
@@ -12,34 +12,27 @@ export function PwaStatusBar({ compact = false }: PwaStatusBarProps) {
   const [showUpdate, setShowUpdate] = useState(false)
 
   useEffect(() => {
-    const syncStatus = () => setStatus({ ...pwaStatus })
+    const syncStatus = () => {
+      setStatus({ ...pwaStatus })
+      setShowInstall(!pwaStatus.isInstalled)
+    }
 
-    const onInstallAvailable = () => {
-      setShowInstall(true)
-      syncStatus()
-    }
-    const onInstalled = () => {
-      setShowInstall(false)
-      syncStatus()
-    }
+    const onInstallAvailable = () => syncStatus()
+    const onInstalled = () => syncStatus()
     const onUpdateReady = () => {
       setShowUpdate(true)
       syncStatus()
     }
-    const onOfflineReady = () => {
-      syncStatus()
-    }
-    const onOnline = () => syncStatus()
-    const onOffline = () => syncStatus()
+    const onStatusChange = () => syncStatus()
 
     window.addEventListener('pwa:install-available', onInstallAvailable)
     window.addEventListener('pwa:installed', onInstalled)
     window.addEventListener('pwa:update-ready', onUpdateReady)
-    window.addEventListener('pwa:offline-ready', onOfflineReady)
-    window.addEventListener('pwa:online', onOnline)
-    window.addEventListener('pwa:offline', onOffline)
-    window.addEventListener('online', onOnline)
-    window.addEventListener('offline', onOffline)
+    window.addEventListener('pwa:offline-ready', onStatusChange)
+    window.addEventListener('pwa:online', onStatusChange)
+    window.addEventListener('pwa:offline', onStatusChange)
+    window.addEventListener('online', onStatusChange)
+    window.addEventListener('offline', onStatusChange)
 
     syncStatus()
 
@@ -47,47 +40,43 @@ export function PwaStatusBar({ compact = false }: PwaStatusBarProps) {
       window.removeEventListener('pwa:install-available', onInstallAvailable)
       window.removeEventListener('pwa:installed', onInstalled)
       window.removeEventListener('pwa:update-ready', onUpdateReady)
-      window.removeEventListener('pwa:offline-ready', onOfflineReady)
-      window.removeEventListener('pwa:online', onOnline)
-      window.removeEventListener('pwa:offline', onOffline)
-      window.removeEventListener('online', onOnline)
-      window.removeEventListener('offline', onOffline)
+      window.removeEventListener('pwa:offline-ready', onStatusChange)
+      window.removeEventListener('pwa:online', onStatusChange)
+      window.removeEventListener('pwa:offline', onStatusChange)
+      window.removeEventListener('online', onStatusChange)
+      window.removeEventListener('offline', onStatusChange)
     }
   }, [])
 
-  if (compact) {
-    return (
-      <div className="mb-3 flex items-center justify-between gap-2 rounded-2xl border border-slate-800 bg-slate-900/80 px-3 py-2 text-xs text-slate-300">
-        <span className="flex items-center gap-2">
-          {status.isOnline ? <Wifi className="h-4 w-4 text-emerald-400" /> : <WifiOff className="h-4 w-4 text-rose-400" />}
-          {status.isOnline ? '🟢 Online' : '🔴 Offline'}
+  const installBanner = showInstall && !status.isInstalled ? (
+    <div className="rounded-2xl border border-cyan-800/60 bg-cyan-950/60 p-3 text-sm text-cyan-100">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <span className="inline-flex items-center gap-2">
+          <Download className="h-4 w-4" />
+          Install BluePad for Offline Use
         </span>
-        {status.isInstalled ? <span className="text-cyan-400">Installed</span> : null}
+        <div className="flex gap-2">
+          <button onClick={() => void installPwa()} className="rounded-xl bg-cyan-500 px-3 py-2 font-semibold text-slate-950">Install</button>
+          <button onClick={() => setShowInstall(false)} className="rounded-xl border border-cyan-700 px-3 py-2">Later</button>
+        </div>
       </div>
-    )
-  }
+    </div>
+  ) : null
+
+  const statusRow = (
+    <div className={`flex items-center justify-between gap-2 rounded-2xl border border-slate-800 bg-slate-900/80 px-3 py-2 ${compact ? 'text-xs' : 'text-sm'} text-slate-300`}>
+      <span className="flex items-center gap-2">
+        {status.isOnline ? <Wifi className="h-4 w-4 text-emerald-400" /> : <WifiOff className="h-4 w-4 text-rose-400" />}
+        {status.isOnline ? 'Online' : 'Offline'}
+      </span>
+      {status.isInstalled ? <span className="flex items-center gap-2 text-cyan-400"><CheckCircle2 className="h-4 w-4" />Installed</span> : <span className="text-slate-400">Browser app</span>}
+    </div>
+  )
 
   return (
-    <div className="mb-4 space-y-3">
-      <div className="flex items-center justify-between gap-2 rounded-2xl border border-slate-800 bg-slate-900/80 px-3 py-2 text-sm text-slate-300">
-        <span className="flex items-center gap-2">
-          {status.isOnline ? <Wifi className="h-4 w-4 text-emerald-400" /> : <WifiOff className="h-4 w-4 text-rose-400" />}
-          {status.isOnline ? '🟢 Online' : '🔴 Offline'}
-        </span>
-        {status.isInstalled ? <span className="flex items-center gap-2 text-cyan-400"><CheckCircle2 className="h-4 w-4" />Installed</span> : null}
-      </div>
-
-      {showInstall && status.canInstall ? (
-        <div className="rounded-2xl border border-cyan-800/60 bg-cyan-950/60 p-3 text-sm text-cyan-100">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <span>Install BluePad for Offline Use</span>
-            <div className="flex gap-2">
-              <button onClick={() => void installPwa()} className="rounded-xl bg-cyan-500 px-3 py-2 font-semibold text-slate-950">Install</button>
-              <button onClick={() => setShowInstall(false)} className="rounded-xl border border-cyan-700 px-3 py-2">Later</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+    <div className={compact ? 'mb-3 space-y-3' : 'mb-4 space-y-3'}>
+      {statusRow}
+      {installBanner}
 
       {showUpdate ? (
         <div className="rounded-2xl border border-amber-800/60 bg-amber-950/60 p-3 text-sm text-amber-100">
