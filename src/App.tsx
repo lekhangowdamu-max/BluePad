@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent a
 import { BookOpen } from 'lucide-react'
 import { Layout } from './components/Layout'
 import { AnalyticsDashboard } from './components/AnalyticsDashboard'
+import { PwaStatusBar } from './components/PwaStatusBar'
 import { AnalyticsService } from './services/analyticsService'
 import { ConnectionManager, type ConnectionStatus } from './services/bluetoothService'
 import { useAppStore } from './stores/appStore'
@@ -13,6 +14,8 @@ function App() {
   const openOrCreateNote = useAppStore((state) => state.openOrCreateNote)
   const updateNoteContent = useAppStore((state) => state.updateNoteContent)
   const setActiveNoteKey = useAppStore((state) => state.setActiveNoteKey)
+  const hydrateNotes = useAppStore((state) => state.hydrateNotes)
+  const syncPendingChanges = useAppStore((state) => state.syncPendingChanges)
 
   const [noteKeyInput, setNoteKeyInput] = useState('')
   const [content, setContent] = useState('')
@@ -34,6 +37,23 @@ function App() {
   const logoClickTimerRef = useRef<number | null>(null)
 
   const activeNote = useMemo(() => notes.find((note) => note.noteKey === activeNoteKey), [notes, activeNoteKey])
+
+  useEffect(() => {
+    void hydrateNotes()
+  }, [hydrateNotes])
+
+  useEffect(() => {
+    const syncOnReconnect = () => {
+      void syncPendingChanges()
+    }
+
+    if (navigator.onLine) {
+      void syncPendingChanges()
+    }
+
+    window.addEventListener('online', syncOnReconnect)
+    return () => window.removeEventListener('online', syncOnReconnect)
+  }, [syncPendingChanges])
 
   useEffect(() => {
     connectionManager.initialize({
@@ -170,6 +190,7 @@ function App() {
   return (
     <Layout>
       <div className="relative mx-auto flex min-h-[calc(100vh-3rem)] max-w-4xl flex-col justify-center px-5 py-10 text-slate-100">
+        <PwaStatusBar />
         {!analyticsView || analyticsView === 'notes' ? (
           <button
             type="button"

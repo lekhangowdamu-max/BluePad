@@ -6,15 +6,17 @@ import { NoteRepository } from '../repositories/noteRepository'
 interface AppState {
   notes: Note[]
   activeNoteKey?: string
+  hydrateNotes: () => Promise<void>
   openOrCreateNote: (noteKey: string) => { note: Note; created: boolean }
   updateNoteContent: (noteKey: string, content: string) => void
   setActiveNoteKey: (noteKey?: string) => void
+  syncPendingChanges: () => Promise<void>
 }
 
 const repository = new NoteRepository()
 
-const persistState = (notes: Note[]) => {
-  repository.saveNotes(notes)
+const persistState = async (notes: Note[]) => {
+  await repository.saveNotes(notes)
 }
 
 export const useAppStore = create<AppState>()(
@@ -22,6 +24,10 @@ export const useAppStore = create<AppState>()(
     (set, get) => ({
       notes: repository.loadNotes(),
       activeNoteKey: undefined,
+      hydrateNotes: async () => {
+        const notes = await repository.loadNotesFromIndexedDb()
+        set({ notes })
+      },
       openOrCreateNote: (noteKey) => {
         const existing = get().notes.find((item) => item.noteKey === noteKey)
         if (existing) {
@@ -38,7 +44,7 @@ export const useAppStore = create<AppState>()(
 
         set((state) => {
           const nextNotes = [created, ...state.notes]
-          persistState(nextNotes)
+          void persistState(nextNotes)
           return { notes: nextNotes, activeNoteKey: created.noteKey }
         })
 
@@ -63,11 +69,14 @@ export const useAppStore = create<AppState>()(
                 ...state.notes,
               ]
 
-          persistState(nextNotes)
+          void persistState(nextNotes)
           return { notes: nextNotes }
         })
       },
       setActiveNoteKey: (noteKey) => set({ activeNoteKey: noteKey }),
+      syncPendingChanges: async () => {
+        await repository.syncPendingChanges()
+      },
     }),
     {
       name: 'bluepad-store',
