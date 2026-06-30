@@ -119,9 +119,10 @@ function App() {
     setStatusMessage(hosts.length > 0 ? 'Select a BluePad Host' : 'No nearby BluePad Hosts found.')
   }
 
-  const handleConnect = (hostId: string) => {
+  const handleConnect = async (hostId: string) => {
     setErrorMessage('')
-    if (connectionManager.connectToHost(hostId)) {
+    const connected = await connectionManager.connectToHost(hostId)
+    if (connected) {
       setRole('client')
       setStatusMessage('Connected to BluePad Host')
     }

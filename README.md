@@ -15,6 +15,23 @@ npm install
 npm run dev
 ```
 
+## Native desktop app (Tauri)
+BluePad now includes a native desktop runtime so discovery and note sync are no longer tied to browser Web Bluetooth limitations.
+
+### Run the native app
+```bash
+npm install
+npx tauri dev
+```
+
+### What changed
+- Native app shell via Tauri for desktop/mobile packaging
+- Native host discovery and peer connection bridge for reliable host announcement
+- Custom BluePad device names shown during discovery
+- Stable host/client connection state with automatic reconnect attempts
+- Offline note sync over the local native transport, with LAN fallback discovery for nearby devices
+- Password-based notes remain supported through the existing note store
+
 ## Progressive Web App
 BluePad is installable and works offline after the first successful load.
 

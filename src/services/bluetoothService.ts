@@ -1,14 +1,11 @@
+import { invoke } from '@tauri-apps/api/core'
 import type { BluetoothDevice, ConnectedDevice, ConnectionStatus, Note } from '../types'
 export type { ConnectionStatus } from '../types'
 
 const DEVICE_NAME_KEY = 'bluepad-device-name'
 const DEVICE_ID_KEY = 'bluepad-device-id'
-const HOST_CHANNEL = 'bluepad-host-channel'
-const NOTE_CHANNEL_PREFIX = 'bluepad-note-'
-const HOST_ANNOUNCE_INTERVAL_MS = 2000
-const DISCOVERY_INTERVAL_MS = 2000
 const RECONNECT_INTERVAL_MS = 5000
-const HOST_STALE_MS = 7000
+const POLL_INTERVAL_MS = 750
 
 interface ConnectionCallbacks {
   onStatusChange: (status: ConnectionStatus) => void
@@ -20,68 +17,45 @@ interface ConnectionCallbacks {
   onHostMessage?: (message: string) => void
 }
 
-interface HostAnnouncement {
-  type: 'host-announcement'
+interface NativeHostInfo {
   id: string
-  deviceName: string
-  sentAt: number
+  device_name: string
+  address: string
+  port: number
+  status: string
 }
 
-interface ClientJoin {
-  type: 'client-join'
-  id: string
-  deviceName: string
-}
-
-interface NoteSync {
-  type: 'note-sync'
-  note: Note
-}
-
-interface OpenNoteRequest {
-  type: 'open-note-request'
-  requestId: string
-  clientId: string
-  passwordKey: string
-}
-
-interface OpenNoteResponse {
-  type: 'open-note-response'
-  requestId: string
-  note: Note
-}
-
-interface ClientNoteChange {
-  type: 'client-note-change'
-  clientId: string
-  note: Note
-}
-
-type HostChannelMessage = HostAnnouncement | ClientJoin | OpenNoteRequest | OpenNoteResponse | ClientNoteChange
-type NoteChannelMessage = NoteSync
-
-const isChromeOrEdge = () => {
-  const userAgent = navigator.userAgent
-  return (/Chrome\//.test(userAgent) || /Edg\//.test(userAgent)) && !/Firefox\//.test(userAgent) && !/OPR\//.test(userAgent)
+interface NativeTransportMessage {
+  from: string
+  from_name: string
+  payload: {
+    type: string
+    requestId?: string
+    clientId?: string
+    passwordKey?: string
+    note?: Note
+    deviceId?: string
+    deviceName?: string
+    hostId?: string
+    status?: string
+    payload?: Record<string, unknown>
+  }
 }
 
 const makeDefaultName = () => `BluePad User ${Math.floor(1000 + Math.random() * 9000)}`
 
 export class ConnectionManager {
   private callbacks: ConnectionCallbacks | null = null
-  private hostChannel?: BroadcastChannel
-  private noteChannels = new Map<string, BroadcastChannel>()
-  private announceTimer?: number
-  private discoveryTimer?: number
   private reconnectTimer?: number
+  private pollTimer?: number
   private hosts = new Map<string, BluetoothDevice>()
   private connectedDevices = new Map<string, ConnectedDevice>()
   private pendingOpenRequests = new Map<string, (note: Note) => void>()
   private isHost = false
-  private isScanning = false
   private connectedHostId?: string
   private preferredHostId?: string
   private readonly deviceId: string
+  private tauriAvailable = false
 
   constructor() {
     this.deviceId = this.getOrCreateDeviceId()
@@ -89,30 +63,23 @@ export class ConnectionManager {
 
   initialize(callbacks: ConnectionCallbacks) {
     this.callbacks = callbacks
-    this.setStatus(this.getBrowserWarning() ? 'Bluetooth Unsupported' : 'Disconnected')
-    this.openHostDiscoveryChannel()
+    this.tauriAvailable = this.isTauriRuntime()
+    this.setStatus('Disconnected')
     this.reconnectTimer = window.setInterval(() => {
       if (!this.preferredHostId || this.isHost) return
 
       const host = this.hosts.get(this.preferredHostId)
-      if (host && !this.isHostStale(host)) {
-        this.connectedHostId = host.id
-        host.status = 'Connected'
-        this.postClientJoin()
-        this.setStatus('Connected')
-        this.emitHosts()
-        return
-      }
-
-      if (this.connectedHostId) {
-        this.connectedHostId = undefined
-      }
-      if (host) {
+      if (host && this.connectedHostId !== host.id) {
         host.status = 'Reconnecting'
+        this.setStatus('Reconnecting')
+        this.emitHosts()
+        void this.connectToHost(host.id)
       }
-      this.setStatus('Reconnecting')
-      this.emitHosts()
     }, RECONNECT_INTERVAL_MS)
+
+    this.pollTimer = window.setInterval(() => {
+      void this.pollMessages()
+    }, POLL_INTERVAL_MS)
   }
 
   getDeviceId() {
@@ -130,16 +97,11 @@ export class ConnectionManager {
   setDeviceName(deviceName: string) {
     const cleanName = deviceName.trim() || makeDefaultName()
     window.localStorage.setItem(DEVICE_NAME_KEY, cleanName)
-    if (this.isHost) {
-      this.announceHost()
-    }
+    void this.setNativeDeviceName(cleanName)
   }
 
   getBrowserWarning() {
-    if (!isChromeOrEdge() || !('bluetooth' in navigator)) {
-      return 'Bluetooth features work best in Chrome and Edge.'
-    }
-    return ''
+    return this.tauriAvailable ? '' : 'BluePad now runs through the native desktop transport. Open it as the Tauri app for reliable discovery.'
   }
 
   getConnectedDevices() {
@@ -153,46 +115,58 @@ export class ConnectionManager {
   async startHost() {
     this.isHost = true
     this.connectedHostId = this.deviceId
-    this.openHostDiscoveryChannel()
-    this.announceHost()
-    if (this.announceTimer) window.clearInterval(this.announceTimer)
-    this.announceTimer = window.setInterval(() => this.announceHost(), HOST_ANNOUNCE_INTERVAL_MS)
+    this.connectedDevices.clear()
     this.setStatus('Host Running')
     this.callbacks?.onHostMessage?.('BluePad Host Running')
+
+    if (!this.tauriAvailable) {
+      this.emitHosts()
+      return
+    }
+
+    try {
+      await this.invokeNative<{ status: string; port: number }>('start_host')
+      this.callbacks?.onHostMessage?.('Native host discovery is active')
+      this.emitHosts()
+    } catch (error) {
+      this.setStatus('Disconnected')
+      this.callbacks?.onHostMessage?.(error instanceof Error ? error.message : 'Unable to start host.')
+    }
   }
 
   async scanForHosts() {
-    this.openHostDiscoveryChannel()
-    this.isScanning = true
     this.setStatus('Searching')
-    this.announceHostProbe()
-    this.startContinuousDiscovery()
+    this.callbacks?.onHostMessage?.('Scanning for nearby BluePad hosts')
 
-    if ('bluetooth' in navigator && typeof navigator.bluetooth?.requestDevice === 'function') {
-      try {
-        const device = await navigator.bluetooth.requestDevice({
-          filters: [{ namePrefix: 'BluePad' }],
-          optionalServices: ['0000feed-0000-1000-8000-00805f9b34fb'],
-        })
-        if (device.name) {
-          this.hosts.set(device.id, {
-            id: device.id,
-            deviceName: device.name,
-            isTrusted: true,
-            status: 'Online',
-            lastSeen: Date.now(),
-          })
-        }
-      } catch {
-        // The user can cancel the browser chooser; keep locally discovered hosts.
-      }
+    if (!this.tauriAvailable) {
+      this.emitHosts()
+      return []
     }
 
-    this.emitHosts()
-    return this.getAvailableHosts()
+    try {
+      const hosts = await this.invokeNative<NativeHostInfo[]>('scan_for_hosts')
+      this.hosts = new Map(hosts.map((host) => [host.id, {
+        id: host.id,
+        deviceName: host.device_name,
+        isTrusted: true,
+        status: host.status as BluetoothDevice['status'],
+        lastSeen: Date.now(),
+      }]))
+      this.emitHosts()
+      return this.getAvailableHosts()
+    } catch (error) {
+      this.setStatus('Disconnected')
+      this.callbacks?.onHostMessage?.(error instanceof Error ? error.message : 'No BluePad hosts found.')
+      return []
+    }
   }
 
-  connectToHost(hostId: string) {
+  async connectToHost(hostId: string) {
+    if (!this.tauriAvailable) {
+      this.setStatus('Disconnected')
+      return false
+    }
+
     const host = this.hosts.get(hostId)
     if (!host) {
       this.setStatus('Disconnected')
@@ -204,12 +178,29 @@ export class ConnectionManager {
     host.status = 'Connecting'
     this.emitHosts()
 
-    this.connectedHostId = host.id
-    host.status = 'Connected'
-    this.postClientJoin()
-    this.setStatus('Connected')
-    this.emitHosts()
-    return true
+    try {
+      const result = await this.invokeNative<{ connected: boolean; host?: NativeHostInfo; error?: string }>('connect_to_host', { host_id: hostId })
+      if (!result.connected) {
+        host.status = 'Disconnected'
+        this.setStatus('Disconnected')
+        this.emitHosts()
+        return false
+      }
+
+      this.connectedHostId = host.id
+      host.status = 'Connected'
+      this.callbacks?.onHostMessage?.(`Connected to ${host.deviceName}`)
+      this.setStatus('Connected')
+      this.emitHosts()
+      void this.sendTransportMessage({ type: 'client-join', clientId: this.deviceId, deviceName: this.getDeviceName() })
+      return true
+    } catch (error) {
+      host.status = 'Disconnected'
+      this.setStatus('Disconnected')
+      this.emitHosts()
+      this.callbacks?.onHostMessage?.(error instanceof Error ? error.message : 'Connection failed.')
+      return false
+    }
   }
 
   openNoteOnHost(passwordKey: string) {
@@ -219,7 +210,7 @@ export class ConnectionManager {
 
     const requestId = crypto.randomUUID()
     return new Promise<Note>((resolve, reject) => {
-      if (!this.connectedHostId || !this.hostChannel) {
+      if (!this.connectedHostId || !this.tauriAvailable) {
         reject(new Error('Connect to a BluePad Host first.'))
         return
       }
@@ -234,12 +225,15 @@ export class ConnectionManager {
         resolve(note)
       })
 
-      this.hostChannel.postMessage({
+      void this.sendTransportMessage({
         type: 'open-note-request',
         requestId,
         clientId: this.deviceId,
         passwordKey,
-      } satisfies OpenNoteRequest)
+      }).catch(() => {
+        this.pendingOpenRequests.delete(requestId)
+        reject(new Error('Unable to reach the host.'))
+      })
     })
   }
 
@@ -250,49 +244,36 @@ export class ConnectionManager {
       return saved ?? note
     }
 
-    if (!this.connectedHostId || !this.hostChannel) {
+    if (!this.connectedHostId || !this.tauriAvailable) {
       throw new Error('Connect to a BluePad Host first.')
     }
 
-    this.hostChannel.postMessage({
+    await this.sendTransportMessage({
       type: 'client-note-change',
       clientId: this.deviceId,
       note,
-    } satisfies ClientNoteChange)
+    })
     return note
   }
 
-  subscribeToNote(passwordKey: string) {
-    const channelName = `${NOTE_CHANNEL_PREFIX}${passwordKey}`
-    if (this.noteChannels.has(channelName)) return
-
-    const channel = new BroadcastChannel(channelName)
-    channel.onmessage = (event: MessageEvent<NoteChannelMessage>) => {
-      if (event.data.type === 'note-sync') {
-        this.callbacks?.onNoteSynced?.(event.data.note)
-      }
-    }
-    this.noteChannels.set(channelName, channel)
+  subscribeToNote(_passwordKey: string) {
+    // The native transport handles note fan-out through the host connection.
   }
 
   broadcastNote(note: Note) {
-    const passwordKey = note.passwordKey ?? note.noteKey
-    const channelName = `${NOTE_CHANNEL_PREFIX}${passwordKey}`
-    let channel = this.noteChannels.get(channelName)
-    if (!channel) {
-      channel = new BroadcastChannel(channelName)
-      this.noteChannels.set(channelName, channel)
+    const payload = {
+      type: 'note-sync',
+      note,
     }
-    channel.postMessage({ type: 'note-sync', note } satisfies NoteSync)
+
+    void this.sendTransportMessage(payload)
+    this.callbacks?.onNoteSynced?.(note)
   }
 
   shutdown() {
-    if (this.announceTimer) window.clearInterval(this.announceTimer)
-    if (this.discoveryTimer) window.clearInterval(this.discoveryTimer)
     if (this.reconnectTimer) window.clearInterval(this.reconnectTimer)
-    this.hostChannel?.close()
-    this.noteChannels.forEach((channel) => channel.close())
-    this.noteChannels.clear()
+    if (this.pollTimer) window.clearInterval(this.pollTimer)
+    void this.invokeNativeSafe('shutdown')
   }
 
   private getOrCreateDeviceId() {
@@ -303,107 +284,123 @@ export class ConnectionManager {
     return next
   }
 
-  private openHostDiscoveryChannel() {
-    if (this.hostChannel) return
-    this.hostChannel = new BroadcastChannel(HOST_CHANNEL)
-    this.hostChannel.onmessage = (event: MessageEvent<HostChannelMessage>) => {
-      if (event.data.type === 'host-announcement' && event.data.id !== this.deviceId) {
-        const existing = this.hosts.get(event.data.id)
-        this.hosts.set(event.data.id, {
-          id: event.data.id,
-          deviceName: event.data.deviceName,
-          isTrusted: true,
-          status: this.connectedHostId === event.data.id ? 'Connected' : 'Online',
-          lastSeen: event.data.sentAt,
-        })
-        if (existing?.status === 'Reconnecting' && this.preferredHostId === event.data.id) {
-          this.connectToHost(event.data.id)
-        }
-        this.emitHosts()
-      }
+  private async setNativeDeviceName(deviceName: string) {
+    if (!this.tauriAvailable) return
+    try {
+      await this.invokeNative<{ deviceName: string }>('set_device_name', { name: deviceName })
+    } catch {
+      // Ignore name sync errors; the app still uses local storage.
+    }
+  }
 
-      if (event.data.type === 'client-join' && this.isHost && event.data.id !== this.deviceId) {
-        this.connectedDevices.set(event.data.id, {
-          id: event.data.id,
-          deviceName: event.data.deviceName,
+  private async pollMessages() {
+    if (!this.tauriAvailable) return
+
+    try {
+      const messages = await this.invokeNative<NativeTransportMessage[]>('poll_messages')
+      for (const message of messages) {
+        this.handleIncomingMessage(message)
+      }
+    } catch {
+      // Ignore transient polling failures until the next cycle.
+    }
+  }
+
+  private handleIncomingMessage(message: NativeTransportMessage) {
+    const payload = message.payload as Record<string, unknown>
+    const payloadType = typeof payload.type === 'string' ? payload.type : ''
+    const eventPayload = payloadType === 'transport-message' && payload.payload && typeof payload.payload === 'object'
+      ? (payload.payload as Record<string, unknown>)
+      : payload
+    const eventType = typeof eventPayload.type === 'string' ? eventPayload.type : ''
+
+    if (eventType === 'host-status') {
+      const status = typeof eventPayload.status === 'string' ? eventPayload.status : 'Host active'
+      this.callbacks?.onHostMessage?.(status)
+      return
+    }
+
+    if (eventType === 'client-join' && this.isHost) {
+      const clientId = typeof eventPayload.clientId === 'string' ? eventPayload.clientId : message.from
+      if (clientId) {
+        this.connectedDevices.set(clientId, {
+          id: clientId,
+          deviceName: typeof eventPayload.deviceName === 'string' ? eventPayload.deviceName : message.from_name,
           status: 'Connected',
         })
         this.emitConnectedDevices()
       }
+      return
+    }
 
-      if (event.data.type === 'open-note-request' && this.isHost && event.data.clientId !== this.deviceId) {
-        const { passwordKey, requestId } = event.data
-        void this.callbacks?.onOpenNoteRequested?.(passwordKey).then((note) => {
-          this.hostChannel?.postMessage({
-            type: 'open-note-response',
-            requestId,
-            note,
-          } satisfies OpenNoteResponse)
+    if (eventType === 'open-note-request' && this.isHost) {
+      const passwordKey = typeof eventPayload.passwordKey === 'string' ? eventPayload.passwordKey : ''
+      void this.callbacks?.onOpenNoteRequested?.(passwordKey).then((note) => {
+        void this.sendTransportMessage({
+          type: 'open-note-response',
+          requestId: typeof eventPayload.requestId === 'string' ? eventPayload.requestId : undefined,
+          note,
         })
-      }
+      })
+      return
+    }
 
-      if (event.data.type === 'open-note-response') {
-        const resolver = this.pendingOpenRequests.get(event.data.requestId)
-        if (resolver) {
-          this.pendingOpenRequests.delete(event.data.requestId)
-          resolver(event.data.note)
-        }
+    if (eventType === 'open-note-response') {
+      const requestId = typeof eventPayload.requestId === 'string' ? eventPayload.requestId : ''
+      const resolver = this.pendingOpenRequests.get(requestId)
+      if (resolver) {
+        this.pendingOpenRequests.delete(requestId)
+        resolver(eventPayload.note as Note)
       }
+      return
+    }
 
-      if (event.data.type === 'client-note-change' && this.isHost && event.data.clientId !== this.deviceId) {
-        void this.callbacks?.onClientNoteChanged?.(event.data.note).then((saved) => {
-          if (saved) this.broadcastNote(saved)
-        })
-      }
+    if (eventType === 'client-note-change' && this.isHost) {
+      void this.callbacks?.onClientNoteChanged?.(eventPayload.note as Note).then((saved) => {
+        if (saved) this.broadcastNote(saved)
+      })
+      return
+    }
+
+    if (eventType === 'note-sync') {
+      this.callbacks?.onNoteSynced?.(eventPayload.note as Note)
     }
   }
 
-  private announceHostProbe() {
-    if (this.isHost) {
-      this.announceHost()
+  private async sendTransportMessage(payload: Record<string, unknown>) {
+    if (!this.tauriAvailable) {
+      throw new Error('Native transport is unavailable.')
     }
-  }
 
-  private announceHost() {
-    this.hostChannel?.postMessage({
-      type: 'host-announcement',
-      id: this.deviceId,
+    const message = JSON.stringify({
+      type: 'transport-message',
+      deviceId: this.deviceId,
       deviceName: this.getDeviceName(),
-      sentAt: Date.now(),
-    } satisfies HostAnnouncement)
-  }
-
-  private postClientJoin() {
-    this.hostChannel?.postMessage({
-      type: 'client-join',
-      id: this.deviceId,
-      deviceName: this.getDeviceName(),
-    } satisfies ClientJoin)
-  }
-
-  private startContinuousDiscovery() {
-    if (this.discoveryTimer) return
-    this.discoveryTimer = window.setInterval(() => {
-      if (!this.isScanning) return
-      this.announceHostProbe()
-      this.pruneStaleHosts()
-      this.emitHosts()
-    }, DISCOVERY_INTERVAL_MS)
-  }
-
-  private pruneStaleHosts() {
-    const now = Date.now()
-    this.hosts.forEach((host) => {
-      if (this.isHostStale(host, now)) {
-        host.status = this.preferredHostId === host.id ? 'Reconnecting' : 'Disconnected'
-      } else if (host.status !== 'Connected' && host.status !== 'Connecting') {
-        host.status = 'Online'
-      }
+      payload,
     })
+    await this.invokeNative<{ sent: boolean; error?: string }>('send_message', { payload: message })
   }
 
-  private isHostStale(host: BluetoothDevice, now = Date.now()) {
-    return Boolean(host.lastSeen && now - host.lastSeen > HOST_STALE_MS)
+  private async invokeNative<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+    this.tauriAvailable = this.isTauriRuntime()
+    if (!this.tauriAvailable) {
+      throw new Error('Native transport is unavailable.')
+    }
+
+    return invoke<T>(command, args)
+  }
+
+  private async invokeNativeSafe(command: string, args: Record<string, unknown> = {}) {
+    try {
+      await this.invokeNative(command, args)
+    } catch {
+      // Ignore shutdown errors.
+    }
+  }
+
+  private isTauriRuntime() {
+    if (typeof window === 'undefined') return false
+    return Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__)
   }
 
   private emitHosts() {
